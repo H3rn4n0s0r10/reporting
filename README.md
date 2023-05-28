@@ -1,4 +1,6 @@
 Monthly Sales Report
+
+
 This R Markdown script generates a monthly sales report for different divisions (RCD, ECD ,PTC, SPK, KSD). The report provides insights into the top bookings, top invoices, and top quotes for each division. The script utilizes data from the bookings, invoices, and quotes datasets to generate visualizations and tables.
 
 Instructions
