@@ -1,0 +1,980 @@
+---
+title: "Monthly Sales and Activity Report"
+author: "Hernan Osorio"
+date: "`r format(Sys.Date())`"
+output:
+      html_document: default
+subtitle: Territory 91, 93 and 94
+---
+
+```{r setup, include = FALSE}
+knitr::opts_chunk$set(warning = FALSE, message = FALSE)
+library(tidyverse)
+library(tidymodels)
+library(lubridate)
+library(kableExtra)
+library(plotly)
+library(scales)
+library(prophet)
+library(modeltime)
+library(timetk)
+library(tseries)
+```
+
+```{r read in invoice data, message=FALSE, warning=FALSE, include=FALSE, paged.print=FALSE}
+invoices <- read_csv("C:/Users/hosorio/OneDrive - U.S. Tsubaki Holdings, Inc/Desktop/My Documents/Personal/R/Tsubaki/monthly_report/invoices-2015-04-01_to_2022-09-30.csv", skip = 4)
+
+scard <- read_csv("C:/Users/hosorio/OneDrive - U.S. Tsubaki Holdings, Inc/Desktop/My Documents/Personal/R/Tsubaki/monthly_report/scard-2015-04-01_to_2022-09-30.csv", skip = 6)
+
+bookings <- read_csv("C:/Users/hosorio/OneDrive - U.S. Tsubaki Holdings, Inc/Desktop/My Documents/Personal/R/Tsubaki/monthly_report/bookings-2015-04-01_to_2022-09-30.csv", skip = 4)
+
+quotes <- read_csv("C:/Users/hosorio/OneDrive - U.S. Tsubaki Holdings, Inc/Desktop/My Documents/Personal/R/Tsubaki/monthly_report/quotes-2015-04-01_to_2022-09-30.csv", skip = 4)
+```
+
+### Total Territory Sales Snapshot
+
+The below table corresponds to the cumulative value for the entire territory for each of our divisions.
+
+```{r echo=FALSE, message=FALSE, warning=FALSE, paged.print=FALSE}
+#creat score card
+scard <- scard %>% 
+        select(DIVISION, YTD...7, YTD...10,  `This Year...19`) %>% 
+        drop_na()
+
+colnames(scard) <- c("div", "dir_sales_ytd", "dir_forecast_ytd", "dir_forecast_year")
+
+scard$div <- as.factor(scard$div)
+
+scorecard <- scard %>% 
+        group_by(div) %>% 
+        summarize(dir_sales_ytd = sum(dir_sales_ytd), dir_forecast_ytd = sum(dir_forecast_ytd), dir_forecast_year = sum(dir_forecast_year)) %>% 
+      mutate(percent_forecast_ytd = (dir_sales_ytd/dir_forecast_ytd)*100) %>% 
+      mutate(percent_forecast_year = (dir_sales_ytd/dir_forecast_year)*100)
+   
+
+kscorecard <- scorecard %>%
+      kbl(aling = 'c', col.names = c("Divition", "Sales YTD", "Forecast YTD", "Forecast for Year", "% Forecast YTD", "% Forecast Year"), digits = 2, format.args = list(big.mark = ',')) %>% 
+      kable_styling(bootstrap_options = c("striped", "hover"), full_width = F, position = "center") %>%
+      add_header_above(c("Values in USD" = 4, "Values in percentage" =2)) %>% 
+      column_spec(c(5,6), background = "#C7FEFB")
+
+kscorecard 
+
+```
+
+These are the combined sales per division for my territory in the last 5 months, :
+
+```{r message=FALSE, warning=FALSE, include=FALSE, paged.print=FALSE}
+#select appropriate columns for analysis
+invoices<- invoices %>% 
+        select(DATE, `Item Number`, Div, Description, Quantity, UM, Price...15, Price...16, `Prod Line`
+               , Country, Code) %>% 
+        mutate(date=dmy(DATE))
+
+#remove the DATE column as I created a new one with the propper format.
+invoices <- invoices %>% 
+        select(-"DATE")
+
+#make column name tidy 
+colnames(invoices) <- c("item_number", "div", "description", "quantity", "um", "price",
+                        "ext_price", "prod_line", "country", "code", "date")
+#Dataframe tidying
+invoices <- invoices %>% 
+      mutate(across(.cols = c("item_number", "div", "um", "prod_line", "country", "code"), .fns = factor)) %>% 
+      arrange(desc(date)) %>% 
+      drop_na(ext_price) %>% 
+      filter(ext_price > 0) %>% 
+      select(-"description") %>% 
+      mutate(count = 1)
+
+#flooring date
+invoices$date <- floor_date(invoices$date, "month")
+
+#making a security copy in invoices2
+invoices2 <- invoices
+
+```
+
+```{r}
+current_month <- floor_date(Sys.Date(), "month") %m-% months(1)
+currente_less_5m <- current_month %m-% months(5)
+
+last_month <- current_month  %m-% months(1)
+last_year <- current_month %m-% months(12)
+```
+
+
+```{r echo=FALSE, message=FALSE, warning=FALSE, paged.print=FALSE}
+inv_total <- invoices %>% 
+      group_by(div, date) %>% 
+      summarize(value = sum(ext_price)) %>% 
+      arrange(desc(date)) %>% 
+      filter(date <= current_month,
+             date >= currente_less_5m)
+
+ginv <- ggplot(inv_total) +
+      aes(x = date, y = value , colour = div) +
+      geom_line(size = 0.5L) +
+      geom_point(aes(alpha = 0.80), size = 1, show.legend = FALSE)+
+      labs( title = "FY23 sales by product line", x = "Date", y = "Value in USD" ) + scale_y_continuous(labels = dollar)
+
+ggplotly(ginv, width = 930, tooltip = c("date", "div", "value"))
+```
+
+it is important to notice that it is hard to establish a trend from a 5 month period, however when analyzed on a longer time frame we could determine a trend and possible a seasonality. I will try to better explore our sales time series in upcoming reports.
+
+```{r message=FALSE, warning=FALSE, include=FALSE, paged.print=FALSE}
+
+inv_total_10y <- invoices %>% 
+      group_by(div, date) %>%
+      summarize(value = sum(ext_price)) %>% 
+      arrange(desc(date)) %>% 
+      filter(date <= "2022-09-01",
+             date >= "2015-04-01")
+
+ginv_10y <- ggplot(inv_total_10y) +
+        aes(x = date, y = value , colour = div) +
+        geom_line(size = 0.5L) +
+        geom_point(size = 1) +
+        labs( title = "10 years of sales", x = "Date", y = "Value in USD") +
+        facet_wrap(~div, ncol = 1, nrow = 5, scales = "free") +
+        scale_y_continuous(labels = dollar) +
+        scale_x_date(date_labels = "%y", date_breaks = "year")+
+        geom_smooth()
+
+gginv_10y <- ggplotly(ginv_10y, width = 930, height = 1200)
+
+```
+
+Below we can see a monthly comparison to last months as well as comparison to the same month of the previous year:
+
+```{r echo=FALSE, message=FALSE, warning=FALSE, paged.print=FALSE}
+current_mon_inv <- invoices %>% 
+        group_by(date) %>% 
+        summarize(sum = sum(ext_price)) %>% 
+        filter(date == current_month)
+
+last_mon_inv <- invoices %>% 
+        group_by(date) %>% 
+        summarize(sum = sum(ext_price)) %>% 
+        filter(date == last_month)
+
+last_year_inv<- invoices %>% 
+        group_by(date) %>% 
+        summarize(sum = sum(ext_price)) %>% 
+        filter(date == last_year)
+
+tot_inv_comp <- rbind(current_mon_inv, last_mon_inv, last_year_inv)
+
+gtot_inv_comp <- tot_inv_comp %>% 
+      ggplot(aes(date, sum))+
+      geom_col(aes(fill=date, alpha = 0.5), show.legend = F) + 
+      scale_y_continuous(labels = dollar) +
+      scale_x_date(date_labels = "%m, %y", date_breaks = "month") +
+      theme(axis.text.x = element_text(angle = 45, hjust = 1)) +
+      labs(title = "Monthly Sales Comparison")
+
+
+ggplotly(gtot_inv_comp, width = 850, tooltip = "sum")
+
+```
+
+```{r Sales Comp Year, message=FALSE, warning=FALSE, include=FALSE, paged.print=FALSE}
+sales_comp_year <- round(((tot_inv_comp[1,2]/tot_inv_comp[3,2])-1)*100, digits = 2)
+sales_comp_month <- round(((tot_inv_comp[1,2]/tot_inv_comp[2,2])-1)*100, digits = 2)
+
+```
+
+```{r message=FALSE, warning=FALSE, include=FALSE, paged.print=FALSE}
+levels_year <- if(tot_inv_comp[1,2] > tot_inv_comp[3,2]) { 
+        print("higher")
+        } else if(tot_inv_comp[1,2] < tot_inv_comp[3,2]){ 
+                print("lower")
+                } else { 
+                        print("equal")
+                        } 
+```
+
+```{r message=FALSE, warning=FALSE, include=FALSE, paged.print=FALSE}
+levels_month <- if(tot_inv_comp[1,2] > tot_inv_comp[2,2]) { 
+        print("higher")
+        } else if(tot_inv_comp[1,2] < tot_inv_comp[2,2]){ 
+                print("lower")
+                } else { 
+                        print("equal")
+                        } 
+```
+
+analyzing the information we can determine that last month total sales were **`r sales_comp_year`**% **`r levels_year`** than the previous year, and **`r sales_comp_month`**% **`r levels_month`** than the previous month. It is important to correlate the Bookings comparison Vs the invoiced number, as the booking numbers reflect the incoming orders, in function of the monthly activity.
+
+```{r message=FALSE, warning=FALSE, include=FALSE, paged.print=FALSE}
+#select appropriate columns for analysis
+bookings <- bookings %>% 
+        select(DATE, `Item Number`, Div, Description, Quantity, UM, Price...15, Price...16, `Prod Line`
+               , Country, Code) %>% 
+        mutate(date=dmy(DATE))
+
+#remove the DATE column as I created a new one with the propper format.
+bookings <- bookings %>% 
+        select(-"DATE")
+
+#make column name tidy 
+colnames(bookings) <- c("item_number", "div", "description", "quantity", "um", "price",
+                        "ext_price", "prod_line", "country", "code", "date")
+#Dataframe tidying
+bookings <- bookings %>% 
+      mutate(across(.cols = c("item_number", "div", "um", "prod_line", "country", "code"), .fns = factor)) %>% 
+      arrange(desc(date)) %>% 
+      drop_na(ext_price) %>% 
+      filter(ext_price > 0) %>% 
+      select(-"description") %>% 
+      mutate(count = 1)
+
+#flooring date
+bookings$date <- floor_date(bookings$date, "month")
+
+```
+
+```{r echo=FALSE, message=FALSE, warning=FALSE, paged.print=FALSE}
+current_mon_book <- bookings %>% 
+      group_by(date) %>%
+      filter(date == current_month) %>% 
+      summarize(sum = sum(ext_price))
+
+last_mon_book <- bookings %>% 
+        group_by(date) %>% 
+        summarize(sum = sum(ext_price)) %>% 
+        filter(date == last_month)
+
+last_year_book <- bookings %>% 
+        group_by(date) %>% 
+        summarize(sum = sum(ext_price)) %>% 
+        filter(date == last_year)
+
+tot_book <- rbind(current_month = current_mon_book, last_month = last_mon_book, last_year = last_year_book)
+
+gtot_book <- tot_book %>% 
+        ggplot(aes(date, sum))+
+        geom_col(aes(fill=date, alpha = 0.5), show.legend = F) + 
+        scale_y_continuous(labels = dollar) +
+        scale_x_date(date_labels = "%m, %y", date_breaks = "month") +
+        theme(axis.text.x = element_text(angle = 45, hjust = 1))+
+        labs(title = "Monthly Bookings Comparison")
+
+ggplotly(gtot_book, width = 850, tooltip = "sum")
+```
+
+```{r message=FALSE, warning=FALSE, include=FALSE, paged.print=FALSE}
+book_comp_year <- round(((tot_book[1,2]/tot_book[3,2])-1)*100, digits = 2)
+book_comp_month <- round(((tot_book[1,2]/tot_book[2,2])-1)*100, digits = 2)
+```
+
+```{r message=FALSE, warning=FALSE, include=FALSE, paged.print=FALSE}
+levels_book_year <- if(tot_book[1,2] > tot_book[2,2]) { 
+        print("higher")
+        } else if(tot_book[1,2] < tot_book[2,2]){
+                print("lower")
+                } else { 
+                        print("equal")
+                        } 
+```
+
+```{r message=FALSE, warning=FALSE, include=FALSE, paged.print=FALSE}
+levels_book_month <- if(tot_book[1,2] > tot_book[3,2]) { 
+        print("higher")
+        } else if(tot_book[1,2] < tot_book[3,2]){ 
+                print("lower")
+                } else { 
+                        print("equal")
+                        } 
+```
+
+Taking into consideration the above the information we can determine that last month total **bookings** were **`r book_comp_year`**% **`r levels_book_year`** than the previous year, and **`r book_comp_month`**% **`r levels_book_month`** than the previous month.
+
+```{r message=FALSE, warning=FALSE, include=FALSE, paged.print=FALSE}
+quotes <- quotes %>% 
+        select(DATE, `Item Number`, Div, Description, Quantity, UM, Price...15, Price...16, `Prod Line`
+               , Country, Code) %>% 
+        mutate(date=dmy(DATE))
+
+#remove the DATE column as I created a new one with the propper format.
+quotes <- quotes %>% 
+        select(-"DATE")
+
+#make column name tidy 
+colnames(quotes) <- c("item_number", "div", "description", "quantity", "um", "price",
+                        "ext_price", "prod_line", "country", "code", "date")
+#Dataframe tidying
+quotes <- quotes %>% 
+      mutate(across(.cols = c("item_number", "div", "um", "prod_line", "country", "code"), .fns = factor)) %>%
+      arrange(desc(date)) %>% 
+      drop_na(ext_price) %>% 
+      filter(ext_price > 0) %>% 
+      mutate(count = 1)
+
+#flooring date
+quotes$date <- floor_date(quotes$date, "month")
+```
+
+```{r Quote count diff months, echo=FALSE, message=FALSE, warning=FALSE, paged.print=FALSE}
+current_mon_quotes <- quotes %>%
+      group_by(date) %>% 
+      filter(date == current_month) %>%
+      summarize(count = sum(count))
+      
+last_mon_quotes <- quotes %>% 
+      group_by(date) %>% 
+      filter(date == last_month) %>%
+      summarize(count = sum(count))
+#### - CUATION look at the appropriet dates to format - ####
+past_4_mon_quotes <- quotes %>% 
+      group_by(date) %>% 
+      filter(date <= current_month %m-% months(2) & date >= current_month %m-% months(6)) %>%
+      summarize(count = sum(count))
+      
+last_year_quotes <- quotes %>%
+      group_by(date) %>% 
+      filter(date <= last_year & date >= last_year %m-% months(5)) %>%
+      summarize(count = sum(count))
+
+tot_quotes <- bind_rows(current_mon_quotes, last_mon_quotes, last_year_quotes, past_4_mon_quotes) %>% 
+      arrange(desc(date))
+
+avg_quote_vol2 <- quotes %>% 
+      group_by(date) %>% 
+      filter(date <= "2022-03-31" & date >= "2017-04-01") %>%
+      summarize(count = sum(count))
+
+mean_quotes2 <-round(mean(avg_quote_vol2$count), digits = 2)
+
+gtot_quotes <- tot_quotes %>% 
+      ggplot(aes(date, count))+
+      geom_col(aes(fill=date, alpha = 0.5), show.legend = F) +
+      scale_x_date(date_labels = "%m, %y", date_breaks = "month") +
+      theme(axis.text.x = element_text(angle = 45, hjust = 1)) +
+      geom_hline(aes(yintercept=mean_quotes2, color = "red")) +
+      labs(title = "Monthly Quote Count Comparison")
+
+ggplotly(gtot_quotes, width = 850, tooltip = "count") %>%
+      layout(showlegend = FALSE)
+```
+
+```{r message=FALSE, warning=FALSE, include=FALSE, paged.print=FALSE}
+quotes_comp_year <- round(((tot_quotes[1,2]/tot_quotes[8,2])-1)*100, digits = 2)
+quotes_comp_month <- round(((tot_quotes[1,2]/tot_quotes[2,2])-1)*100, digits = 2)
+```
+
+```{r message=FALSE, warning=FALSE, include=FALSE, paged.print=FALSE}
+levels_quotes_year <- if(tot_quotes[1,2] > tot_quotes[8,2]) { 
+        print("higher")
+        } else if(tot_quotes[1,2] < tot_quotes[8,2]){ 
+                print("lower")
+                } else { 
+                        print("equal")
+                        } 
+```
+
+```{r message=FALSE, warning=FALSE, include=FALSE, paged.print=FALSE}
+levels_quote_month <- if(tot_quotes[1,2] > tot_quotes[3,2]) { 
+        print("higher")
+        } else if(tot_quotes[1,2] < tot_quotes[3,2]){ 
+                print("lower")
+                } else { 
+                        print("equal")
+                        } 
+```
+
+With the previous table in mind I can clearly establish that last month total quote count was **`r quotes_comp_year`**% **`r levels_quotes_year`** than the previous year, and **`r quotes_comp_month`**% **`r levels_quote_month`** than the previous month.
+
+Looking 6 month quote volume comparison chart we can determine our current quote output. This is **crucial** as there is a direct correlation in between quote output and bookings. The horizontal red line represents the average quote output for the past 5 years, which currently stands at **`r mean_quotes2`** per month.
+
+it is important to understand how our capacity to produce quotes affects our bookings, therefore we need to look at the below correlation matrix for the booking values, total bookings per month, quote values and total quotes per month.
+
+```{r echo=FALSE, message=FALSE, warning=FALSE, paged.print=FALSE}
+corr_mat_inv <- invoices %>% 
+      group_by(date) %>% 
+      filter(date >= "2015-04-01" & date <= "2022-04-01") %>% 
+      summarise(value = sum(ext_price), count = sum(count))
+
+corr_mat_bookings <- bookings %>% 
+      group_by(date) %>% 
+      filter(date >= "2015-04-01" & date <= "2022-04-01") %>% 
+      summarise(value = sum(ext_price), count = sum(count))
+
+corr_mat_quotes <- quotes %>% 
+      group_by(date) %>% 
+      filter(date >= "2015-04-01" & date <= "2022-04-01") %>% 
+      summarise(value = sum(ext_price), count = sum(count))
+
+
+
+corr_mat <- bind_cols(corr_mat_bookings, corr_mat_quotes) 
+
+corr_mat <- corr_mat %>% 
+      select(-c("date...4"))
+
+colnames(corr_mat) <- c("date", "val_booking", "count_bookings", "val_quotes", "count_quotes")
+
+correlation_in_numbers <- corr_mat %>% 
+        select_if(is.numeric) %>% 
+        cor()    
+
+correlation_in_numbers2 <- correlation_in_numbers %>% 
+      kbl(aling = 'c', col.names = c("Bookings Value", "Bookings Count", "Quotes Value", "Quotes Count"), 
+          digits = 2, format.args = list(big.mark = ',')) %>% 
+                  kable_styling(bootstrap_options = c("striped", "hover"), full_width = FALSE, position = "center") %>% 
+                  add_header_above(c("Correlation Matrix" =5)) %>% 
+                  column_spec(c(5), background = "#C7FEFB")
+
+correlation_in_numbers2
+
+```
+
+Correlation coefficients are indicators of the strength of the linear relationship between two different variables, quotes and bookings. A linear correlation coefficient that is greater than zero indicates a positive relationship. Looking at the corresponding quote values and count we can see a positive correlation. Thus meaning that the amount of quotes and their values do have a show a positive impact in the bookings values and quantity. This is clear indicator that we need to get back on track when it comes to our quote production, in order to maintain our required growth we must get back to the **`r mean_quotes2`** per month figure.
+
+#### **Quotes with an 80% possibility of being won:**
+
+Below we can see the various open opportunities, in which the distribution network and I believe we have an 80% chance of bringing to fruition within the current fiscal year:
+
+![](images/80%25%20quotes.jpg)
+
+At the moment I have healthy pipeline for open opportunities throughout the entire tirrtory with a high probability of brought to fruition. Even though I feel confident of the mentioned projects, there is still a chance that we don't get them all.
+
+it is also import that mention that I have a healthy backlog of open orders that are to be shipped before the end of the fiscal year:
+
+![](images/Open%20order%20sep%202022-01.jpg)
+
+After taking a look at our more general indicators, it is necessary to dig deeper per division. With a closer look at the months information per division we can look at our top 5 bookings and 5 invoices above \$1000 with all its corresponding information.
+
+### [**EDC:**]{.underline}
+
+```{r Top Bookings ECD, echo=FALSE, message=FALSE, warning=FALSE, paged.print=FALSE}
+top_bookings_ECD <- bookings %>% 
+      filter(div == "ECD") %>% 
+      filter(date == current_month) %>%
+      filter(ext_price >="1000") %>% 
+      arrange(desc(ext_price)) %>% 
+      head(5)
+
+
+if(nrow(top_bookings_ECD)==0) {
+      print("There are no ECD bookings to show for this month")} else{ 
+            kstop_bookings_ECD <- top_bookings_ECD %>%
+                  kbl(aling = 'c', col.names = c("item_number", "div", "quantity", "um", "price", "ext_price",
+                                                 "prod_line", "country", "code", "date", "count"), digits = 2, format.args =
+                            list(big.mark = ',')) %>%
+                  kable_styling(bootstrap_options = c("striped", "hover"), full_width = T, position = "center") %>%
+                  add_header_above(c("Top ECD Bookings" =11)) %>%
+                  column_spec(c(5,6), background = "#C7FEFB")
+
+kstop_bookings_ECD
+}
+
+```
+
+```{r Top Invoices ECD, echo=FALSE, message=FALSE, warning=FALSE, paged.print=FALSE}
+top_invoice_ECD <- invoices %>% 
+      filter(div == "ECD") %>%
+      filter(date == current_month) %>% 
+      filter(ext_price >= "1000") %>%
+      arrange(desc(ext_price)) %>% 
+      head(5)
+
+if(nrow(top_invoice_ECD)==0) {
+      print("There are no ECD invoices to show for this month")} else{
+            ktop_invoice_ECD <- top_invoice_ECD %>%
+                  kbl(aling = 'c', col.names = c("item_number", "div", "quantity", "um", "price", "ext_price",
+                                                 "prod_line", "country", "code", "date", "count"), digits = 2, format.args =
+                            list(big.mark = ',')) %>% 
+                  kable_styling(bootstrap_options = c("striped", "hover"), full_width = T, position = "center") %>% 
+                  add_header_above(c("Top Invoices ECD" =11)) %>% 
+                  column_spec(c(5,6), background = "#C7FEFB")
+            ktop_invoice_ECD
+}
+
+```
+
+```{r Top Quotes ECD, echo=FALSE, message=FALSE, warning=FALSE, paged.print=FALSE}
+top_quotes_ECD <- quotes %>% 
+      filter(div == "ECD") %>%
+      filter(date == current_month) %>% 
+      filter(ext_price >= "1000") %>%
+      arrange(desc(ext_price)) %>%
+      select(-"count") %>% 
+      head(5)
+
+if(nrow(top_quotes_ECD)==0) {
+      print("There are no ECD invoices to show for this month")} else{
+            ktop_quotes_ECD <- top_quotes_ECD %>%
+                  kbl(aling = 'c', col.names = c("item_number", "div", "description", "quantity", "um", "price", "ext_price",
+                                                 "prod_line", "country", "code", "date"), digits = 2, format.args =
+                            list(big.mark = ',')) %>% 
+                  kable_styling(bootstrap_options = c("striped", "hover"), full_width = T, position = "center") %>% 
+                  add_header_above(c("Top Quotess ECD" =11)) %>% 
+                  column_spec(c(5,6), background = "#C7FEFB")
+            ktop_quotes_ECD
+}
+
+```
+
+### ECD Activity:
+
+The month of September was a good month of opportunities for the ECD division. At the moment I am working with Aderca in the DR, on a sugar mill project at La Romana. Currently the mill is using Webster chains. The opportunity was quoted on 1021149 for a total value of \$97,116, this corresponds to two different chains, a 973R with A2 on every pithc and a 627R with A2 on every pitch.
+
+![](images/Plano%20Webster.jpg)
+
+On the other side of the agricultural spectrum I am working with Componentes Industriales and the end user Aba Norte for a grain handling facility. We quoted 750 pitch of GH-400, on quote 1020579 for a total of \$17,962.
+
+![](images/GH400.jpg)
+
+I am currently working with Rodamundi in Cali, we have been providing support for the asphalt plant Cachibi. They are currently needing the asphalt incline conveyor chain. At the moment we have provided quote 1021554 for a total amount of \$16,680 for a US3945 with K1/k3 every third:
+
+![](images/Cachibi.jpg)
+
+Utilizing our historical data starting on April first of 2015 to October first of 2022, I can create a forecast for the next 6 months utilizing the prophet algorithm . This algorithm will give me a upper and lower limits as to where we can expect our bookings for EDC be for the rest remainder of the fiscal year. My foresting algorithm is under construction and I will improve upon it as the year progresses, thank you for understanding.
+
+```{r ECD Prophet MAYBE WRONG!!!!, echo=FALSE, message=FALSE, warning=FALSE, paged.print=FALSE}
+#######################################################################
+#######################################################################
+bookings_prophet_ECD <- bookings %>% 
+      filter(div == "ECD") %>% 
+      group_by(date) %>% 
+      filter(date >= "2015-04-01" & date <= "2022-10-01" ) %>% 
+      summarize(ext_price =sum(ext_price), count = sum(count)) %>% 
+      select(ds = "date", y = "ext_price", "count")
+
+bookings_prophet_ECD$floor <- 0
+
+model_prophet_edc <- prophet(bookings_prophet_ECD, 
+                             yearly.seasonality = TRUE,
+                               seasonality.mode = "multiplicative")
+
+```
+
+```{r echo=FALSE, message=FALSE, warning=FALSE, paged.print=FALSE}
+future_vals_edc <- make_future_dataframe(model_prophet_edc, periods = 6, freq = "month")
+future_vals_edc$floor <- 0
+
+forecast_ecd <- predict(model_prophet_edc, future_vals_edc)
+
+predictions <- forecast_ecd %>% 
+      select("ds", "yhat", "yhat_lower", "yhat_upper")
+
+
+dyplot.prophet(model_prophet_edc, forecast_ecd)
+```
+
+```{r ECD comp plot, eval=FALSE, message=FALSE, warning=FALSE, include=FALSE, paged.print=FALSE}
+prophet_plot_components(model_prophet_edc, forecast_ecd)
+```
+
+### [**RCD:**]{.underline}
+
+```{r Top Bookincolnamesgs RCD, echo=FALSE, message=FALSE, warning=FALSE, paged.print=FALSE}
+top_bookings_RCD <- bookings %>% 
+      filter(div == "RCD") %>% 
+      filter(date == current_month) %>%
+      filter(ext_price >= "1000") %>% 
+      arrange(desc(ext_price)) %>% 
+      head(5)
+
+
+if(nrow(top_bookings_RCD)==0) {
+      print("There are no RCD bookings to show for this month")} else{
+            ktop_bookings_RCD <- top_bookings_RCD %>% 
+                  kbl(aling = 'c', col.names = c("item_number", "div", "quantity", "um", "price", "ext_price",
+                                                 "prod_line", "country", "code", "date", "count"), digits = 2, format.args = 
+                            list(big.mark = ',')) %>% 
+                  kable_styling(bootstrap_options = c("striped", "hover"), full_width = T, position = "center") %>%
+                  add_header_above(c("Top Bookings RCD" =11)) %>% 
+                  column_spec(c(5,6), background = "#C7FEFB")
+            ktop_bookings_RCD
+      }
+```
+
+```{r Top Invoices RCD, echo=FALSE, message=FALSE, warning=FALSE, paged.print=FALSE}
+top_invoice_RCD <- invoices2 %>% 
+      filter(div == "RCD") %>%
+      filter(date == current_month) %>% 
+      filter(ext_price >= "1000") %>% 
+      arrange(desc(ext_price)) %>%
+      head(5)
+
+
+if(nrow(top_bookings_RCD)==0) {
+      print("There are no RCD invoices to show for this month")} else{
+            ktop_invoice_RCD <-  top_invoice_RCD %>% 
+                  kbl(aling = 'c', col.names = c("item_number", "div", "description", "quantity", "um", "price", "ext_price",
+                                                 "prod_line", "country", "code", "date"), digits = 2, format.args =
+                            list(big.mark = ',')) %>% 
+                  kable_styling(bootstrap_options = c("striped", "hover"), full_width = T, position = "center") %>%
+                  add_header_above(c("Top Invoices RCD" =11)) %>% 
+                  column_spec(c(5,6), background = "#C7FEFB")
+            ktop_invoice_RCD
+      }
+
+```
+
+```{r echo=FALSE, message=FALSE, warning=FALSE, paged.print=FALSE}
+top_quotes_rcd <- quotes %>% 
+      filter(div == "RCD") %>%
+      filter(date == "2022-09-01") %>% 
+      filter(ext_price >= "1000") %>%
+      arrange(desc(ext_price)) %>%
+      select(-"count") %>% 
+      head(5)
+
+if(nrow(top_quotes_rcd)==0) {
+      print("There are no ECD invoices to show for this month")} else{
+            ktop_quotes_rcd <- top_quotes_rcd %>%
+                  kbl(aling = 'c', col.names = c("item_number", "div", "description", "quantity", "um", "price", "ext_price",
+                                                 "prod_line", "country", "code", "date"), digits = 2, format.args =
+                            list(big.mark = ',')) %>% 
+                  kable_styling(bootstrap_options = c("striped", "hover"), full_width = T, position = "center") %>% 
+                  add_header_above(c("Top Quotess RCD" =11)) %>% 
+                  column_spec(c(5,6), background = "#C7FEFB")
+            ktop_quotes_rcd
+}
+```
+
+### RCD Activity:
+
+In September, I travel to Costa Rica to work with Campos Rudin. I had the opportunity to visit Del Oro and obtain a small PO for \$290.80, this can referenced to PO3481-22 of neptune RS50 chain for the freezers. This is an initial test paid for by the customer; once the chain has proven its efficacy in the freezers operational conditions, we will proceed with all freezer chains.
+
+On my travel to Costa Rica y was able to visit Alimentos Jacks in San Jose. Alimentos Jacks is a snack manufacturer, currently they are a Tsubaki user. At the moment we have provided a quote for a C2062HASD1/4L, this is for a total of \$11,487 and can be referenced to quote 1019469:
+
+![](images/PLANO%20CADENA%20CEREALES%20-%20Jacks.jpg)
+
+In Costa Rica I met with the intermediate mill manager as well as the boiler manager in charge of the bagasse conveyors for the Taboga Sugar Mill. This particular mill buys roller chain from our distributor.
+
+![](images/Taboga%203.jpg)
+
+![](images/Taboga%204.jpg)
+
+Currently Taboga is getting ready to purchase RS140 chain for the intermediate mills, as they have already check for elongation and are out of norm. we are in the process of quoting a 5 strand of RS120-3 .
+
+Just as we did before, with the aid of the historical data and the prophet algorithm, I can forecast the last 6 months of the current fiscal year.
+
+```{r RCD Prophet, echo=FALSE, message=FALSE, warning=FALSE, paged.print=FALSE}
+bookings_prophet_RCD <- bookings %>% 
+      filter(div == "RCD") %>% 
+      group_by(date) %>% 
+      filter(date >= "2015-04-01" & date <= "2022-10-01" ) %>% 
+      summarize(ext_price =sum(ext_price), count = sum(count)) %>% 
+      select(ds = "date", y = "ext_price", "count")
+
+model_prophet_rcd <- prophet(bookings_prophet_RCD)
+future_vals_rcd <- make_future_dataframe(model_prophet_rcd, periods = 6, freq = "month")
+
+forecast_rcd <- predict(model_prophet_rcd, future_vals_rcd)
+
+dyplot.prophet(model_prophet_rcd, forecast_rcd)
+```
+
+```{r eval=FALSE, message=FALSE, warning=FALSE, include=FALSE, paged.print=FALSE}
+prophet_plot_components(model_prophet_rcd, forecast_rcd)
+```
+
+### [**PTC:**]{.underline}
+
+```{r Top Bookings PTC, echo=FALSE, message=FALSE, warning=FALSE, paged.print=FALSE}
+top_bookings_PTC <- bookings %>% 
+      filter(div == "PTC") %>% 
+      filter(date == current_month) %>%
+      arrange(desc(ext_price)) %>% 
+      head(5)
+
+if(nrow(top_bookings_PTC)==0) {
+      print("There are no PTC Bookings to show for this month")} else{
+            ktop_bookings_PTC <- top_bookings_PTC %>% 
+                  kbl(aling = 'c', col.names = c("item_number", "div", "quantity", "um", "price", "ext_price",
+                                                 "prod_line", "country", "code", "date", "count"), digits = 2, format.args =
+                            list(big.mark = ',')) %>% 
+                  kable_styling(bootstrap_options = c("striped", "hover"), full_width = T, position = "center") %>%
+                  add_header_above(c("Top Bookings PTC" =11)) %>% 
+                  column_spec(c(5,6), background = "#C7FEFB")
+            ktop_bookings_PTC
+      }
+
+
+```
+
+```{r Top Invoices PTC, echo=FALSE, message=FALSE, warning=FALSE, paged.print=FALSE}
+top_invoice_PTC <- invoices2 %>% 
+      filter(div == "PTC") %>%
+      filter(date == current_month) %>% 
+      arrange(desc(ext_price)) %>%
+      head(5)
+
+if(nrow(top_invoice_PTC)==0) {
+      print("There are no PTC Invoices to show for this month")} else{
+            ktop_invoice_PTC <- top_invoice_PTC %>% 
+                  kbl(aling = 'c', col.names = c("item_number", "div", "quantity", "um", "price", "ext_price",
+                                                 "prod_line", "country", "code", "date", "count"), digits = 2, format.args =
+                            list(big.mark = ',')) %>% 
+                  kable_styling(bootstrap_options = c("striped", "hover"), full_width = T, position = "center") %>% 
+                  add_header_above(c("Top Invoices PTC" =11)) %>% 
+                  column_spec(c(5,6), background = "#C7FEFB")
+            ktop_invoice_PTC 
+      }
+
+   
+```
+
+```{r echo=FALSE, message=FALSE, warning=FALSE, paged.print=FALSE}
+top_quotes_ptc <- quotes %>% 
+      filter(div == "PTC") %>%
+      filter(date == current_month) %>% 
+      filter(ext_price >= "1000") %>%
+      arrange(desc(ext_price)) %>%
+      select(-"count") %>% 
+      head(5)
+
+if(nrow(top_quotes_ptc)==0) {
+      print("There are no ECD invoices to show for this month")} else{
+            ktop_quotes_ptc <- top_quotes_ptc %>%
+                  kbl(aling = 'c', col.names = c("item_number", "div", "description", "quantity", "um", "price", "ext_price",
+                                                 "prod_line", "country", "code", "date"), digits = 2, format.args =
+                            list(big.mark = ',')) %>% 
+                  kable_styling(bootstrap_options = c("striped", "hover"), full_width = T, position = "center") %>% 
+                  add_header_above(c("Top Quotess PTC" =11)) %>% 
+                  column_spec(c(5,6), background = "#C7FEFB")
+            ktop_quotes_ptc
+}
+```
+
+### PTC Activity
+
+The power transmission components division has been steady growing, it is imperative that we try to forecast the end of the year figure. This giving us the opportunity to correct our course of action if needed.
+
+I am currently working on a great opportunity with the Jaremar Group in Honduras. We quoted 3 units of a BS200FZ and 3 units of a BS165F. These are use for their main palm conveyors for the Clover oil production facility, this can be seen on quote 1020573 for a total of \$70,156.
+
+In the mean time I am working with Componentes Industriales at the Bimbo facility in Guatemala. They are currently planning on changing out an indexing clutch for their doe machine:
+
+![](images/clutch-bimbo-01.jpg)
+
+At the moment this is still on a project stage, as we are gathering all the information required to make a successful offer.
+
+```{r PTC Prophet, echo=FALSE, message=FALSE, warning=FALSE, paged.print=FALSE}
+bookings_prophet_ptc <- bookings %>% 
+      filter(div == "PTC") %>% 
+      group_by(date) %>% 
+      filter(date >= "2015-04-01" & date <= "2022-10-01" ) %>% 
+      summarize(ext_price =sum(ext_price), count = sum(count)) %>% 
+      select(ds = "date", y = "ext_price", "count") %>% 
+      filter(y >= 0) %>% 
+      drop_na(y)
+      
+
+model_prophet_ptc <- prophet(bookings_prophet_ptc)
+future_vals_ptc <- make_future_dataframe(model_prophet_ptc, periods = 6, freq = "month")
+
+forecast_ptc <- predict(model_prophet_ptc, future_vals_ptc)
+
+dyplot.prophet(model_prophet_ptc, forecast_ptc)
+```
+
+```{r eval=FALSE, message=FALSE, warning=FALSE, include=FALSE, paged.print=FALSE}
+prophet_plot_components(model_prophet_ptc, forecast_ptc)
+
+```
+
+### [**SPK:**]{.underline}
+
+```{r Top Bookings SPK, echo=FALSE, message=FALSE, warning=FALSE, paged.print=FALSE}
+top_bookings_SPK <- bookings %>% 
+      filter(div == "SPK") %>% 
+      filter(date == "2022-09-01") %>%
+      arrange(desc(ext_price)) %>% 
+      head(5)
+
+if(nrow(top_bookings_SPK)==0) {
+      print("There are no SPK Bookings to show for this month")} else{
+            ktop_bookings_SPK <- top_bookings_SPK %>% 
+                  kbl(aling = 'c', col.names = c("item_number", "div", "quantity", "um", "price", "ext_price", "prod_line", "country", "code", "date", "count"), digits = 2, format.args = list(big.mark = ',')) %>% 
+                  kable_styling(bootstrap_options = c("striped", "hover"), full_width = T, position = "center") %>% 
+                  add_header_above(c("Top Bookings SPK" =11)) %>% 
+                  column_spec(c(5,6), background = "#C7FEFB")
+            ktop_bookings_SPK
+}
+```
+
+```{r Top Invoices SPK, echo=FALSE, message=FALSE, warning=FALSE, paged.print=FALSE}
+top_invoice_SPK <- invoices2 %>% 
+      filter(div == "SPK") %>%
+      filter(date == current_month) %>% 
+      arrange(desc(ext_price)) %>%
+      head(5)
+
+if(nrow(top_invoice_SPK)==0) {
+      print("There are no SPK Invoices to show for this month")} else{
+            ktop_invoice_SPK <- top_invoice_SPK %>% 
+                  kbl(aling = 'c', col.names = c("item_number", "div", "quantity", "um", "price", "ext_price", "prod_line", "country", "code", "date", "count"), digits = 2, format.args = list(big.mark = ',')) %>% 
+                  kable_styling(bootstrap_options = c("striped", "hover"), full_width = T, position = "center") %>%
+                  add_header_above(c("Top Invoices SPK" =11)) %>% 
+                  column_spec(c(5,6), background = "#C7FEFB")
+            ktop_invoice_SPK 
+      }
+
+     
+```
+
+```{r echo=FALSE, message=FALSE, warning=FALSE, paged.print=FALSE}
+top_quotes_spk <- quotes %>% 
+      filter(div == "SPK") %>%
+      filter(date == current_month) %>% 
+      filter(ext_price >= "1000") %>%
+      arrange(desc(ext_price)) %>%
+      select(-"count") %>% 
+      head(5)
+
+if(nrow(top_quotes_spk)==0) {
+      print("There are no ECD invoices to show for this month")} else{
+            ktop_quotes_spk <- top_quotes_spk %>%
+                  kbl(aling = 'c', col.names = c("item_number", "div", "description", "quantity", "um", "price", "ext_price",
+                                                 "prod_line", "country", "code", "date"), digits = 2, format.args =
+                            list(big.mark = ',')) %>% 
+                  kable_styling(bootstrap_options = c("striped", "hover"), full_width = T, position = "center") %>% 
+                  add_header_above(c("Top Quotess SPK" =11)) %>% 
+                  column_spec(c(5,6), background = "#C7FEFB")
+            ktop_quotes_spk
+}
+```
+
+### SPK Activity:
+
+The roller chain sprockets division is one that present the most lag in bookings when compared to the others. Our smarttooth is liked by both end users and the distribution network, however our regular sprockets are not considered to add value over the local competition, thus creating a difficult situation.
+
+In my travels to Cali I was able to visit the Pichichi sugar mill. The Pichichi sugar mill used to be dominated by Webster through Benar. Currently Pichichi has a new administration team, and Webster is no longer the preferred vendor. Currently we are competing against Genmil, and it is mostly due to a payment plan offered by Genmil. Currently we are gathering all the information regarding attachment spacing and total quantities needed for the 2184 chain as well as their main cane carrier. Pichichi will open the public bidding in December of this calendar year. Not only will we offer our chain and roller chain sprockets, but I belie we have a great opportunity to offer our drum sprockets, as they are in current need of some:
+
+![](images/pichichi3.jpg)
+
+In the mean time we are working on a quote for Campos Rudin fore some interesting sprockets, for the Taboga Sugar Mill. The sprockets are T120B21, T120B38, T120C23 one of each stock bore. We are working hard to be able to supply the sprockets and chain.
+
+```{r SPK Prophet, echo=FALSE, message=FALSE, warning=FALSE, paged.print=FALSE}
+bookings_prophet_spk <- bookings %>% 
+      filter(div == "SPK") %>% 
+      group_by(date) %>% 
+      filter(date >= "2015-04-01" & date <= "2022-10-01" ) %>% 
+      summarize(ext_price =sum(ext_price), count = sum(count)) %>% 
+      select(ds = "date", y = "ext_price", "count") %>% 
+      filter(y >= 0) %>% 
+      drop_na(y)
+      
+
+model_prophet_spk <- prophet(bookings_prophet_spk)
+future_vals_spk <- make_future_dataframe(model_prophet_spk, periods = 6, freq = "month")
+
+forecast_spk <- predict(model_prophet_spk, future_vals_spk)
+
+dyplot.prophet(model_prophet_spk, forecast_spk)
+```
+
+```{r eval=FALSE, message=FALSE, warning=FALSE, include=FALSE, paged.print=FALSE}
+prophet_plot_components(model_prophet_spk, forecast_spk)
+
+```
+
+### [**KSD:**]{.underline}
+
+```{r Top Bookings KSD, echo=FALSE, message=FALSE, warning=FALSE, paged.print=FALSE}
+top_bookings_KSD <- bookings %>% 
+      filter(div == "KSD") %>% 
+      filter(date == current_month) %>%
+      arrange(desc(ext_price)) %>% 
+      head(5)
+
+if(nrow(top_bookings_KSD)==0) {
+      print("There are no KSD Bookings to show for this month")} else{
+            ktop_bookings_KSD <- top_bookings_KSD %>% 
+                  kbl(aling = 'c', col.names = c("item_number", "div", "quantity", "um", "price", "ext_price", "prod_line", "country", "code", "date", "count"), digits = 2, format.args = list(big.mark = ',')) %>% 
+                  kable_styling(bootstrap_options = c("striped", "hover"), full_width = T, position = "center") %>% 
+                  add_header_above(c("VTop Bookings KSD" =11)) %>% 
+                  column_spec(c(5,6), background = "#C7FEFB")
+            ktop_bookings_KSD
+      }
+
+```
+
+```{r Top Invoices KSD, echo=FALSE, message=FALSE, warning=FALSE, paged.print=FALSE}
+top_invoice_KSD <- invoices2 %>% 
+      filter(div == "KSD") %>%
+      filter(date == current_month) %>% 
+      arrange(desc(ext_price)) %>%
+      head(5)
+
+if(nrow(top_invoice_KSD)==0) {
+      print("There are no KSD Invoices to show for this month")} else{
+            ktop_invoice_KSD <- top_invoice_KSD %>% 
+                  kbl(aling = 'c', col.names = c("item_number", "div", "quantity", "um", "price", "ext_price", "prod_line", "country", "code", "date", "count"), digits = 2, format.args = list(big.mark = ',')) %>% 
+                  kable_styling(bootstrap_options = c("striped", "hover"), full_width = T, position = "center") %>%
+                  add_header_above(c("Top Invoice KSD" =11)) %>% 
+                  column_spec(c(5,6), background = "#C7FEFB")
+            ktop_invoice_KSD
+      }
+```
+
+```{r echo=FALSE, message=FALSE, warning=FALSE, paged.print=FALSE}
+top_quotes_ksd <- quotes %>% 
+      filter(div == "KSD") %>%
+      filter(date == current_month) %>% 
+      filter(ext_price >= "1000") %>%
+      arrange(desc(ext_price)) %>%
+      select(-"count") %>% 
+      head(5)
+
+if(nrow(top_quotes_ksd)==0) {
+      print("There are no ECD invoices to show for this month")} else{
+            ktop_quotes_ksd <- top_quotes_ksd %>%
+                  kbl(aling = 'c', col.names = c("item_number", "div", "description", "quantity", "um", "price", "ext_price",
+                                                 "prod_line", "country", "code", "date"), digits = 2, format.args =
+                            list(big.mark = ',')) %>% 
+                  kable_styling(bootstrap_options = c("striped", "hover"), full_width = T, position = "center") %>% 
+                  add_header_above(c("Top Quotess KSD" =11)) %>% 
+                  column_spec(c(5,6), background = "#C7FEFB")
+            ktop_quotes_ksd
+}
+```
+
+### KSD Activity:
+
+Cable Carriers had a good month, we are currently working on a new opportunity in Corona. The cable carrier is a the solution that the end user is looking for. The end user want to change out the current guide channel. The current guide channel has a different design as can be seen in the picture:
+
+![](images/Corona%20bandeja.jpg)
+
+In my last visit this month, I was able to inspect the machine and determine that the roller design would be trouble some for our quoted track. Andres Gutierrez and his technical team with my support decided to offer a new guide channels with the new track. The quoted track hast gliding shoes, therefore I believe that the "rolling" track would not work well. The corresponding quote is 1019807 for a total of \$9,095.
+
+The cable carrier division is a great opportunity generator in my territories, especially territory 91 and 93, where we have already deployed fully harnessed cable tracks and guide channels.
+
+```{r KSD Prophet, echo=FALSE, message=FALSE, warning=FALSE, paged.print=FALSE}
+bookings_prophet_ksd <- bookings %>% 
+      filter(div == "KSD") %>% 
+      group_by(date) %>% 
+      filter(date >= "2015-04-01" & date <= "2022-10-01" ) %>% 
+      summarize(ext_price =sum(ext_price), count = sum(count)) %>% 
+      select(ds = "date", y = "ext_price", "count") %>% 
+      filter(y >= 0) %>% 
+      drop_na(y)
+      
+
+model_prophet_ksd <- prophet(bookings_prophet_ksd)
+future_vals_ksd <- make_future_dataframe(model_prophet_ksd, periods = 6, freq = "month")
+
+forecast_ksd <- predict(model_prophet_ksd, future_vals_ksd)
+
+dyplot.prophet(model_prophet_ksd, forecast_ksd)
+```
+
+```{r eval=FALSE, message=FALSE, warning=FALSE, include=FALSE, paged.print=FALSE}
+prophet_plot_components(model_prophet_ksd, forecast_ksd)
+```
+
+As closing remarks I have to mention that I will be traveling the month of October as fallows:
+
+-   Cali, Colombia - from the 2nd to the 6th.
+
+-   Bogota, Colombia - the 13th and 14th.
+
+-   Quito, Ecuador - 17th to the 21st.
+
+END OF REPORT.
